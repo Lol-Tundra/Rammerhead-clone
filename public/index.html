@@ -158,6 +158,7 @@
                 if (!inputVal.trim()) return;
                 
                 let target = inputVal.trim();
+                // Ensure protocol is present if it looks like a domain
                 if (!target.startsWith('http') && target.includes('.')) {
                     target = `https://${target}`;
                 }
@@ -271,7 +272,8 @@
                 );
             }
 
-            // CRUCIAL CHANGE: Prepend the proxy path to the target URL
+            // CRITICAL FIX: Prepend the proxy path to the target URL
+            // activeTab.url holds the full target URL (e.g., https://google.com)
             const proxyIframeSrc = `/proxy/${activeTab.url}`;
 
             // If URL is present, render the iframe "browser"
