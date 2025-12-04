@@ -15,84 +15,129 @@ app.use(express.raw({ type: '*/*', limit: '10mb' }));
 
 // -----------------------------------------------------------------------------
 // CLIENT-SIDE INJECTION SCRIPT
-// This script is injected into HTML pages to intercept JS-driven requests (AJAX/Fetch)
 // -----------------------------------------------------------------------------
 const CLIENT_INJECTION = `
 <script>
 (function() {
     const PROXY_BASE = '/proxy?url=';
-    const currentUrl = new URL(window.location.href).searchParams.get('url') || '';
-    
-    // Helper to encode URLs for the proxy
+    const originalUrl = new URL(window.location.href).searchParams.get('url');
+    const currentOrigin = originalUrl ? new URL(originalUrl).origin : window.location.origin;
+
+    // Helper: Rewrite URL to go through proxy
     function rewriteUrl(url) {
         if (!url) return url;
-        if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('#')) return url;
-        if (url.startsWith('/proxy')) return url;
+        if (typeof url !== 'string') return url;
+        if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('about:')) return url;
+        if (url.startsWith(window.location.origin + '/proxy')) return url;
         
+        // If it's already a full URL
+        if (url.startsWith('http')) {
+             return PROXY_BASE + encodeURIComponent(url);
+        }
+        
+        // Resolve relative URL
         try {
-            // Resolve relative URLs against the REAL current URL, not the proxy URL
-            const resolved = new URL(url, currentUrl).href;
+            const resolved = new URL(url, originalUrl || window.location.href).href;
             return PROXY_BASE + encodeURIComponent(resolved);
         } catch(e) { return url; }
     }
 
-    // 1. Intercept standard fetch requests (used by YouTube, modern sites)
+    // --- 1. PROPERTY INTERCEPTORS (The Magic) ---
+    // This traps any JS trying to set .src or .href and rewrites it instantly
+    
+    const elementConfig = [
+        { tag: 'HTMLAnchorElement', attr: 'href' },
+        { tag: 'HTMLImageElement', attr: 'src' },
+        { tag: 'HTMLScriptElement', attr: 'src' },
+        { tag: 'HTMLLinkElement', attr: 'href' },
+        { tag: 'HTMLIFrameElement', attr: 'src' },
+        { tag: 'HTMLMediaElement', attr: 'src' }, // Video & Audio
+        { tag: 'HTMLSourceElement', attr: 'src' },
+        { tag: 'HTMLFormElement', attr: 'action' }
+    ];
+
+    elementConfig.forEach(config => {
+        const proto = window[config.tag] && window[config.tag].prototype;
+        if (!proto) return;
+
+        const descriptor = Object.getOwnPropertyDescriptor(proto, config.attr);
+        // Save original setter to call later
+        const originalSet = descriptor ? descriptor.set : null;
+        const originalGet = descriptor ? descriptor.get : null;
+
+        Object.defineProperty(proto, config.attr, {
+            get: function() {
+                // Optional: Return original URL to trick scripts checking for validity
+                return originalGet ? originalGet.call(this) : this.getAttribute(config.attr);
+            },
+            set: function(value) {
+                const proxied = rewriteUrl(value);
+                if (originalSet) {
+                    originalSet.call(this, proxied);
+                } else {
+                    this.setAttribute(config.attr, proxied);
+                }
+            }
+        });
+    });
+
+    // --- 2. NATIVE API INTERCEPTORS ---
+
+    // Fetch
     const originalFetch = window.fetch;
     window.fetch = function(input, init) {
         let url = input;
         if (typeof input === 'string') {
             url = rewriteUrl(input);
         } else if (input instanceof Request) {
-            // Clone the request with the new URL
             url = new Request(rewriteUrl(input.url), input);
         }
         return originalFetch(url, init);
     };
 
-    // 2. Intercept XMLHttpRequest (used by older sites, Google)
+    // XMLHttpRequest
     const originalOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url, ...args) {
         return originalOpen.call(this, method, rewriteUrl(url), ...args);
     };
 
-    // 3. Intercept Form Submissions
-    document.addEventListener('submit', function(e) {
-        const form = e.target;
-        if (form.action) {
-            form.action = rewriteUrl(form.getAttribute('action'));
-        }
-    }, true);
+    // Workers (Poki / Games use this heavily)
+    const OriginalWorker = window.Worker;
+    window.Worker = function(scriptURL, options) {
+        return new OriginalWorker(rewriteUrl(scriptURL), options);
+    };
 
-    // 4. Force URL rewriting on History API (fixes "jumping links")
+    // Window.open
+    const originalWindowOpen = window.open;
+    window.open = function(url, target, features) {
+        return originalWindowOpen(rewriteUrl(url), target, features);
+    };
+
+    // History API
     const originalPushState = history.pushState;
     const originalReplaceState = history.replaceState;
-
-    history.pushState = function(state, unused, url) {
-        // We don't want to actually change the browser URL bar to the target site, 
-        // we just want to update the internal state if needed.
-        // For a proxy, we usually ignore this or rewrite it to the proxy format.
-        if (url) {
-            return originalPushState.call(this, state, unused, rewriteUrl(url));
-        }
-        return originalPushState.call(this, state, unused, url);
-    };
     
-    history.replaceState = function(state, unused, url) {
-        if (url) {
-            return originalReplaceState.call(this, state, unused, rewriteUrl(url));
-        }
-        return originalReplaceState.call(this, state, unused, url);
+    // We mock these to prevent the URL bar from showing the long proxy URL, 
+    // but internally we keep track of state.
+    history.pushState = function(state, title, url) {
+        // console.log('PushState blocked/rewritten', url);
+        // We can just ignore visual URL updates or rewrite them safely
+        return originalPushState.call(this, state, title, null);
+    };
+    history.replaceState = function(state, title, url) {
+        return originalReplaceState.call(this, state, title, null);
     };
 
 })();
 </script>
 `;
 
-// Helper: Rewrite URLs in static HTML/CSS content
-const rewriteUrl = (url, baseUrl) => {
+// Helper: Rewrites URLs in HTML/CSS text
+const rewriteUrlRegex = (url, baseUrl) => {
     try {
-        if (!url) return url;
-        if (url.startsWith('data:') || url.startsWith('#') || url.startsWith('/proxy')) return url;
+        if (!url || url.trim() === '') return url;
+        if (url.startsWith('data:') || url.startsWith('#')) return url;
+        
         const absoluteUrl = new URL(url, baseUrl).href;
         return `/proxy?url=${encodeURIComponent(absoluteUrl)}`;
     } catch (e) {
@@ -102,121 +147,112 @@ const rewriteUrl = (url, baseUrl) => {
 
 app.all('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
-
-    if (!targetUrl) {
-        return res.status(400).send('URL parameter is required');
-    }
+    if (!targetUrl) return res.status(400).send('URL required');
 
     try {
         const targetUrlObj = new URL(targetUrl);
 
-        // Prepare headers to look like a real browser
-        const headers = {
-            'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': req.headers['accept'] || '*/*',
-            'Accept-Language': req.headers['accept-language'] || 'en-US,en;q=0.9',
-            // Crucial: Forward cookies from the client to the target
-            'Cookie': req.headers['cookie'] || '',
-            // Spoof Referer and Origin to bypass hotlink protection
-            'Referer': targetUrlObj.origin + '/',
-            'Origin': targetUrlObj.origin
-        };
+        // Forward headers
+        const headers = {};
+        const headersToForward = ['user-agent', 'accept', 'accept-language', 'cookie', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'upgrade-insecure-requests'];
+        
+        headersToForward.forEach(h => {
+            if (req.headers[h]) headers[h] = req.headers[h];
+        });
 
-        // Handle POST body forwarding
+        // Spoof Referer/Origin
+        headers['Referer'] = targetUrlObj.origin + '/';
+        headers['Origin'] = targetUrlObj.origin;
+
         const fetchOptions = {
             method: req.method,
             headers: headers,
             redirect: 'follow'
         };
 
-        if (req.method !== 'GET' && req.method !== 'HEAD') {
+        if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
             fetchOptions.body = req.body;
         }
 
         const response = await fetch(targetUrl, fetchOptions);
-
-        // --- RESPONSE HANDLING ---
-
-        // 1. Forward Cookies from Target -> Client
-        // We need to rewrite the Domain/Path of cookies so the browser accepts them for our proxy domain
-        const rawCookies = response.headers.raw()['set-cookie'];
-        if (rawCookies) {
-            const newCookies = rawCookies.map(cookie => {
-                // Remove Domain/Secure/SameSite attributes to force browser to accept it on localhost/render
-                return cookie.replace(/Domain=[^;]+;/i, '').replace(/Secure;/i, '').replace(/SameSite=[^;]+;/i, '');
-            });
-            res.setHeader('Set-Cookie', newCookies);
-        }
-
-        // 2. Filter Security Headers (CORS/Frame Blocking)
-        const headersToBlock = [
-            'content-encoding', 
-            'content-length', 
-            'x-frame-options', 
-            'content-security-policy', 
-            'x-content-type-options',
-            'access-control-allow-origin' // We set our own
-        ];
-
-        response.headers.forEach((value, name) => {
-            if (!headersToBlock.includes(name.toLowerCase())) {
-                res.setHeader(name, value);
-            }
-        });
-
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        
-        const contentType = response.headers.get('content-type') || '';
         const finalUrl = response.url;
 
-        // 3. Content Rewriting
+        // Forward Response Headers
+        response.headers.forEach((value, name) => {
+            const n = name.toLowerCase();
+            // Strip restrictive headers
+            if (!['content-encoding', 'content-length', 'transfer-encoding', 'content-security-policy', 'content-security-policy-report-only', 'x-frame-options', 'x-content-type-options'].includes(n)) {
+                // Rewrite Set-Cookie domains
+                if (n === 'set-cookie') {
+                    const cookies = response.headers.raw()['set-cookie'].map(c => 
+                        c.replace(/Domain=[^;]+;/i, '').replace(/Secure;/i, '').replace(/SameSite=[^;]+;/i, '')
+                    );
+                    res.setHeader('Set-Cookie', cookies);
+                } else {
+                    res.setHeader(name, value);
+                }
+            }
+        });
+        
+        // CORS for everyone
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', '*');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+
+        const contentType = response.headers.get('content-type') || '';
+
         if (contentType.includes('text/html')) {
             let body = await response.text();
 
-            // Inject the Client-Side Script immediately after <head>
+            // 1. Remove Integrity attributes (SRI) - causes blocks if we modify content
+            body = body.replace(/integrity="[^"]*"/gi, '');
+
+            // 2. Inject Script
             body = body.replace('<head>', `<head>${CLIENT_INJECTION}`);
 
-            // Robust Regex Rewriting for attributes
-            // Covers src, href, action, poster (video), data-src, srcset
-            const attributeRegex = /\b(href|src|action|poster|data-src|srcset)=["']([^"']+)["']/gi;
-            
-            body = body.replace(attributeRegex, (match, attr, rawUrl) => {
-                // Handle srcset separately as it has comma-separated URLs
-                if (attr === 'srcset') {
-                    return `${attr}="${rawUrl.split(',').map(part => {
-                        const [u, w] = part.trim().split(/\s+/);
-                        return rewriteUrl(u, finalUrl) + (w ? ` ${w}` : '');
-                    }).join(', ')}"`;
-                }
-                return `${attr}="${rewriteUrl(rawUrl, finalUrl)}"`;
+            // 3. Rewrite HTML attributes
+            // Using a broader regex to catch href, src, action, data-src, poster
+            body = body.replace(/\b(href|src|action|poster|data-src)=["']([^"']+)["']/gi, (match, attr, url) => {
+                return `${attr}="${rewriteUrlRegex(url, finalUrl)}"`;
             });
 
-            // Rewrite URL inside CSS styles in HTML
-            body = body.replace(/url\((['"]?)([^'")]+)\1\)/gi, (match, quote, rawUrl) => {
-                return `url(${quote}${rewriteUrl(rawUrl, finalUrl)}${quote})`;
+            // 4. Rewrite CSS url()
+            body = body.replace(/url\((['"]?)([^'")]+)\1\)/gi, (match, quote, url) => {
+                return `url(${quote}${rewriteUrlRegex(url, finalUrl)}${quote})`;
+            });
+
+            // 5. Rewrite srcset (images)
+            body = body.replace(/srcset=["']([^"']+)["']/gi, (match, srcsetContent) => {
+                const newSrcset = srcsetContent.split(',').map(part => {
+                    const [url, desc] = part.trim().split(/\s+/);
+                    return rewriteUrlRegex(url, finalUrl) + (desc ? ` ${desc}` : '');
+                }).join(', ');
+                return `srcset="${newSrcset}"`;
             });
 
             res.send(body);
 
         } else if (contentType.includes('text/css')) {
             let body = await response.text();
-            body = body.replace(/url\((['"]?)([^'")]+)\1\)/gi, (match, quote, rawUrl) => {
-                return `url(${quote}${rewriteUrl(rawUrl, finalUrl)}${quote})`;
+            body = body.replace(/url\((['"]?)([^'")]+)\1\)/gi, (match, quote, url) => {
+                return `url(${quote}${rewriteUrlRegex(url, finalUrl)}${quote})`;
             });
-            res.setHeader('Content-Type', 'text/css');
             res.send(body);
+
         } else if (contentType.includes('javascript') || contentType.includes('application/x-javascript')) {
-             // We generally don't rewrite JS files via regex because it breaks code easily.
-             // The CLIENT_INJECTION script handles the dynamic requests made by these JS files.
+             // For JS, we just pipe it. 
+             // We generally DO NOT want to regex replace inside JS files as it often breaks syntax.
+             // Our CLIENT_INJECTION handles the dynamic loading at runtime.
              response.body.pipe(res);
         } else {
-            // Pipe binary data (Video, Images, Audio)
+            // Binary (Images, Video, etc.)
             response.body.pipe(res);
         }
 
     } catch (error) {
-        console.error('Proxy Error:', error.message);
-        res.status(500).send(`Error fetching ${targetUrl}: ${error.message}`);
+        console.error('Proxy Error:', error);
+        res.status(500).send('Error');
     }
 });
 
