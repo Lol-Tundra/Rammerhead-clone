@@ -11,7 +11,7 @@ app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Middleware to parse raw body for POST requests
-app.use(express.raw({ type: '*/*', limit: '10mb' }));
+app.use(express.raw({ type: '*/*', limit: '20mb' }));
 
 // -----------------------------------------------------------------------------
 // CLIENT-SIDE INJECTION SCRIPT
@@ -20,38 +20,40 @@ const CLIENT_INJECTION = `
 <script>
 (function() {
     const PROXY_BASE = '/proxy?url=';
-    const originalUrl = new URL(window.location.href).searchParams.get('url');
-    const currentOrigin = originalUrl ? new URL(originalUrl).origin : window.location.origin;
+    const originalUrlParam = new URL(window.location.href).searchParams.get('url');
+    // If we are in a proxy page, the origin is the target, otherwise logic might differ
+    const currentOrigin = originalUrlParam ? new URL(originalUrlParam).origin : window.location.origin;
 
     // Helper: Rewrite URL to go through proxy
     function rewriteUrl(url) {
         if (!url) return url;
         if (typeof url !== 'string') return url;
-        if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('about:')) return url;
-        if (url.startsWith(window.location.origin + '/proxy')) return url;
+        if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('about:') || url.startsWith('javascript:')) return url;
+        if (url.includes('/proxy?url=')) return url;
         
-        // If it's already a full URL
+        // Handle absolute URLs
         if (url.startsWith('http')) {
              return PROXY_BASE + encodeURIComponent(url);
         }
         
-        // Resolve relative URL
+        // Handle relative URLs
         try {
-            const resolved = new URL(url, originalUrl || window.location.href).href;
+            // If we are already proxied, we need to resolve against the ORIGINAL url, not the proxy host
+            const base = originalUrlParam || window.location.href;
+            const resolved = new URL(url, base).href;
             return PROXY_BASE + encodeURIComponent(resolved);
         } catch(e) { return url; }
     }
 
-    // --- 1. PROPERTY INTERCEPTORS (The Magic) ---
-    // This traps any JS trying to set .src or .href and rewrites it instantly
-    
+    // --- 1. PROPERTY INTERCEPTORS ---
     const elementConfig = [
         { tag: 'HTMLAnchorElement', attr: 'href' },
         { tag: 'HTMLImageElement', attr: 'src' },
+        { tag: 'HTMLImageElement', attr: 'srcset' }, // Added srcset support
         { tag: 'HTMLScriptElement', attr: 'src' },
         { tag: 'HTMLLinkElement', attr: 'href' },
         { tag: 'HTMLIFrameElement', attr: 'src' },
-        { tag: 'HTMLMediaElement', attr: 'src' }, // Video & Audio
+        { tag: 'HTMLMediaElement', attr: 'src' },
         { tag: 'HTMLSourceElement', attr: 'src' },
         { tag: 'HTMLFormElement', attr: 'action' }
     ];
@@ -61,17 +63,26 @@ const CLIENT_INJECTION = `
         if (!proto) return;
 
         const descriptor = Object.getOwnPropertyDescriptor(proto, config.attr);
-        // Save original setter to call later
         const originalSet = descriptor ? descriptor.set : null;
         const originalGet = descriptor ? descriptor.get : null;
 
         Object.defineProperty(proto, config.attr, {
             get: function() {
-                // Optional: Return original URL to trick scripts checking for validity
+                // Return the original URL if scripts ask, to avoid breaking logic that checks domains
                 return originalGet ? originalGet.call(this) : this.getAttribute(config.attr);
             },
             set: function(value) {
-                const proxied = rewriteUrl(value);
+                let proxied = value;
+                if (config.attr === 'srcset') {
+                    // Handle srcset specially
+                    proxied = value.split(',').map(part => {
+                        const [url, desc] = part.trim().split(/\s+/);
+                        return rewriteUrl(url) + (desc ? ' ' + desc : '');
+                    }).join(', ');
+                } else {
+                    proxied = rewriteUrl(value);
+                }
+
                 if (originalSet) {
                     originalSet.call(this, proxied);
                 } else {
@@ -82,8 +93,6 @@ const CLIENT_INJECTION = `
     });
 
     // --- 2. NATIVE API INTERCEPTORS ---
-
-    // Fetch
     const originalFetch = window.fetch;
     window.fetch = function(input, init) {
         let url = input;
@@ -95,38 +104,38 @@ const CLIENT_INJECTION = `
         return originalFetch(url, init);
     };
 
-    // XMLHttpRequest
     const originalOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url, ...args) {
         return originalOpen.call(this, method, rewriteUrl(url), ...args);
     };
 
-    // Workers (Poki / Games use this heavily)
+    // Workers for games
     const OriginalWorker = window.Worker;
     window.Worker = function(scriptURL, options) {
         return new OriginalWorker(rewriteUrl(scriptURL), options);
     };
-
-    // Window.open
-    const originalWindowOpen = window.open;
-    window.open = function(url, target, features) {
-        return originalWindowOpen(rewriteUrl(url), target, features);
-    };
-
-    // History API
-    const originalPushState = history.pushState;
-    const originalReplaceState = history.replaceState;
     
-    // We mock these to prevent the URL bar from showing the long proxy URL, 
-    // but internally we keep track of state.
-    history.pushState = function(state, title, url) {
-        // console.log('PushState blocked/rewritten', url);
-        // We can just ignore visual URL updates or rewrite them safely
-        return originalPushState.call(this, state, title, null);
+    // Image Constructor (for preloading)
+    const OriginalImage = window.Image;
+    window.Image = function(width, height) {
+        const img = new OriginalImage(width, height);
+        // We define a setter on this specific instance to trap .src assignment
+        let internalSrc = '';
+        Object.defineProperty(img, 'src', {
+            get: () => internalSrc,
+            set: (val) => {
+                internalSrc = val;
+                img.setAttribute('src', rewriteUrl(val));
+            }
+        });
+        return img;
     };
-    history.replaceState = function(state, title, url) {
-        return originalReplaceState.call(this, state, title, null);
-    };
+
+    // Prevent frame busting (sites trying to break out of iframe)
+    try {
+        window.top = window.self;
+        window.parent = window.self;
+    } catch(e) {}
 
 })();
 </script>
@@ -160,6 +169,11 @@ app.all('/proxy', async (req, res) => {
             if (req.headers[h]) headers[h] = req.headers[h];
         });
 
+        // Add Range header support (Critical for video)
+        if (req.headers.range) {
+            headers['range'] = req.headers.range;
+        }
+
         // Spoof Referer/Origin
         headers['Referer'] = targetUrlObj.origin + '/';
         headers['Origin'] = targetUrlObj.origin;
@@ -167,7 +181,7 @@ app.all('/proxy', async (req, res) => {
         const fetchOptions = {
             method: req.method,
             headers: headers,
-            redirect: 'follow'
+            redirect: 'manual' // Manual redirect handling is CRITICAL for proxying
         };
 
         if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
@@ -175,6 +189,19 @@ app.all('/proxy', async (req, res) => {
         }
 
         const response = await fetch(targetUrl, fetchOptions);
+        
+        // Handle Redirects Manually
+        if (response.status >= 300 && response.status < 400 && response.headers.has('location')) {
+            const location = response.headers.get('location');
+            const absoluteLocation = new URL(location, targetUrl).href;
+            const proxyPath = `/proxy?url=${encodeURIComponent(absoluteLocation)}`;
+            
+            res.setHeader('Location', proxyPath);
+            res.status(response.status);
+            res.end();
+            return;
+        }
+
         const finalUrl = response.url;
 
         // Forward Response Headers
@@ -182,7 +209,8 @@ app.all('/proxy', async (req, res) => {
             const n = name.toLowerCase();
             // Strip restrictive headers
             if (!['content-encoding', 'content-length', 'transfer-encoding', 'content-security-policy', 'content-security-policy-report-only', 'x-frame-options', 'x-content-type-options'].includes(n)) {
-                // Rewrite Set-Cookie domains
+                
+                // Rewrite Set-Cookie
                 if (n === 'set-cookie') {
                     const cookies = response.headers.raw()['set-cookie'].map(c => 
                         c.replace(/Domain=[^;]+;/i, '').replace(/Secure;/i, '').replace(/SameSite=[^;]+;/i, '')
@@ -194,35 +222,44 @@ app.all('/proxy', async (req, res) => {
             }
         });
         
-        // CORS for everyone
+        // CORS
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', '*');
         res.setHeader('Access-Control-Allow-Credentials', 'true');
 
+        // Status
+        res.status(response.status);
+
         const contentType = response.headers.get('content-type') || '';
+
+        // ---------------------------------------------------------------------
+        // CONTENT REWRITING
+        // ---------------------------------------------------------------------
 
         if (contentType.includes('text/html')) {
             let body = await response.text();
 
-            // 1. Remove Integrity attributes (SRI) - causes blocks if we modify content
+            // Remove Integrity (SRI)
             body = body.replace(/integrity="[^"]*"/gi, '');
+            
+            // Remove CSP Meta tags
+            body = body.replace(/<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
 
-            // 2. Inject Script
+            // Inject Script
             body = body.replace('<head>', `<head>${CLIENT_INJECTION}`);
 
-            // 3. Rewrite HTML attributes
-            // Using a broader regex to catch href, src, action, data-src, poster
+            // HTML Attributes
             body = body.replace(/\b(href|src|action|poster|data-src)=["']([^"']+)["']/gi, (match, attr, url) => {
                 return `${attr}="${rewriteUrlRegex(url, finalUrl)}"`;
             });
 
-            // 4. Rewrite CSS url()
+            // CSS url()
             body = body.replace(/url\((['"]?)([^'")]+)\1\)/gi, (match, quote, url) => {
                 return `url(${quote}${rewriteUrlRegex(url, finalUrl)}${quote})`;
             });
 
-            // 5. Rewrite srcset (images)
+            // Srcset
             body = body.replace(/srcset=["']([^"']+)["']/gi, (match, srcsetContent) => {
                 const newSrcset = srcsetContent.split(',').map(part => {
                     const [url, desc] = part.trim().split(/\s+/);
@@ -233,6 +270,19 @@ app.all('/proxy', async (req, res) => {
 
             res.send(body);
 
+        } else if (contentType.includes('application/x-mpegurl') || contentType.includes('application/vnd.apple.mpegurl')) {
+            // HLS Video Support (.m3u8)
+            let body = await response.text();
+            // Rewrite lines that are URLs (not starting with #)
+            const lines = body.split('\n');
+            const newBody = lines.map(line => {
+                if (line.trim() && !line.trim().startsWith('#')) {
+                    return rewriteUrlRegex(line.trim(), finalUrl);
+                }
+                return line;
+            }).join('\n');
+            res.send(newBody);
+
         } else if (contentType.includes('text/css')) {
             let body = await response.text();
             body = body.replace(/url\((['"]?)([^'")]+)\1\)/gi, (match, quote, url) => {
@@ -240,19 +290,18 @@ app.all('/proxy', async (req, res) => {
             });
             res.send(body);
 
-        } else if (contentType.includes('javascript') || contentType.includes('application/x-javascript')) {
-             // For JS, we just pipe it. 
-             // We generally DO NOT want to regex replace inside JS files as it often breaks syntax.
-             // Our CLIENT_INJECTION handles the dynamic loading at runtime.
-             response.body.pipe(res);
         } else {
-            // Binary (Images, Video, etc.)
+            // Binary (Images, Video, Flash, etc.)
+            // Pipe directly. The status code (200 or 206) is already set above.
             response.body.pipe(res);
         }
 
     } catch (error) {
         console.error('Proxy Error:', error);
-        res.status(500).send('Error');
+        // Only send error if headers haven't been sent
+        if (!res.headersSent) {
+            res.status(500).send('Error processing request: ' + error.message);
+        }
     }
 });
 
