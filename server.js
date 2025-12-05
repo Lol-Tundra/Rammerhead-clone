@@ -131,6 +131,27 @@ const CLIENT_INJECTION = `
         return img;
     };
 
+    // --- 3. TAB/WINDOW MANAGEMENT INTERCEPTORS ---
+    // Intercept window.open
+    window.open = function(url, target, features) {
+        if (url) {
+            const fullUrl = rewriteUrl(url);
+            // Send message to parent (React App) to open a new tab
+            window.parent.postMessage({ type: 'PROXY_NEW_TAB', url: fullUrl }, '*');
+        }
+        return null; // Block native popup
+    };
+
+    // Intercept clicks on _blank links
+    document.addEventListener('click', (e) => {
+        const link = e.target.closest('a');
+        if (link && (link.target === '_blank' || link.target === '_new')) {
+            e.preventDefault();
+            // link.href returns the resolved absolute URL which is already proxied due to getters/setters or HTML rewriting
+            window.parent.postMessage({ type: 'PROXY_NEW_TAB', url: link.href }, '*');
+        }
+    }, true);
+
     // Prevent frame busting (sites trying to break out of iframe)
     try {
         window.top = window.self;
