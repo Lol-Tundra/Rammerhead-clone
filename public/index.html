@@ -305,11 +305,6 @@
                         allowFullScreen={true}
                         onLoad={onLoadEnd}
                     />
-                    
-                    {/* Overlay for sites that refuse to connect (basic hint) */}
-                    <div className="hidden peer-has-[:error]:flex absolute inset-0 bg-[#111] text-gray-400 flex-col items-center justify-center pointer-events-none">
-                        <p>Could not connect to {activeTab.url}</p>
-                    </div>
                 </div>
             );
         };
@@ -329,8 +324,6 @@
 
         const App = () => {
             const [tabs, setTabs] = useState([INITIAL_TAB]);
-            // If INITIAL_TAB.id is called again it will differ, so we must set initial state carefully or use the object above
-            // Fix: Re-initialize to ensure matching IDs
             const [activeTabId, setActiveTabId] = useState(tabs[0].id);
 
             const activeTab = tabs.find(t => t.id === activeTabId) || tabs[0];
@@ -365,14 +358,24 @@
             };
 
             const handleNewTab = (initialUrl) => {
-                // Determine if initialUrl is an event object (from click) or a string (from postMessage)
-                const urlToUse = (typeof initialUrl === 'string') ? initialUrl : '';
+                let urlToUse = (typeof initialUrl === 'string') ? initialUrl : '';
                 
-                // If it's a proxied URL (coming from server logic), we might want to decode it for the UI bar
-                // But generally handleNavigate handles the raw logic.
-                // If the server sends a full http://localhost:3000/proxy?url=..., handleNavigate might double proxy if we aren't careful.
-                // BrowserContent.getProxyUrl checks for existing proxy.
-                
+                // --- CLEAN UP PROXY URL FOR UI ---
+                // If the server sends a proxied URL (e.g., from window.open interception),
+                // we extract the real URL to show in the address bar.
+                if (urlToUse.includes('/proxy?url=')) {
+                    try {
+                        // Use a dummy base to parse relative proxy paths
+                        const urlObj = new URL(urlToUse, window.location.origin);
+                        const realUrl = urlObj.searchParams.get('url');
+                        if (realUrl) {
+                            urlToUse = realUrl;
+                        }
+                    } catch(e) {
+                        console.error('Failed to parse proxy URL', e);
+                    }
+                }
+
                 const newTab = {
                     id: generateId(),
                     url: urlToUse,
@@ -388,10 +391,7 @@
             const handleCloseTab = (id, e) => {
                 e.stopPropagation();
                 if (tabs.length === 1) {
-                    // Reset the last tab instead of removing it
                     const newId = generateId();
-                    // We must update the tabs array AND the activeTabId if we are closing the active one
-                    // Easier to just reset the current tab content
                     updateTab(id, { 
                         url: '', 
                         title: 'New Tab', 
