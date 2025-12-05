@@ -162,8 +162,8 @@
                 if (!target.startsWith('http') && target.includes('.')) {
                     target = `https://${target}`;
                 } else if (!target.startsWith('http')) {
-                    // Google Search fallback
-                    target = `https://www.google.com/search?q=${encodeURIComponent(target)}`;
+                    // Bing Search fallback
+                    target = `https://www.bing.com/search?q=${encodeURIComponent(target)}`;
                 }
                 onNavigate(target);
             };
@@ -207,7 +207,7 @@
                             type="text"
                             value={inputVal}
                             onChange={(e) => setInputVal(e.target.value)}
-                            placeholder="Search the web freely..."
+                            placeholder="Search with Bing or enter URL..."
                             className="w-full bg-[#0a0a0a] text-gray-200 text-sm rounded-md py-1.5 pl-9 pr-4 focus:outline-none focus:ring-1 focus:ring-red-900 border border-[#333] focus:border-red-800 transition-all font-mono"
                         />
                     </form>
@@ -227,7 +227,7 @@
                 if (!target.startsWith('http') && target.includes('.')) {
                     target = `https://${target}`;
                 } else if (!target.startsWith('http')) {
-                    target = `https://www.google.com/search?q=${encodeURIComponent(target)}`;
+                    target = `https://www.bing.com/search?q=${encodeURIComponent(target)}`;
                 }
                 onNavigate(target);
             };
@@ -265,7 +265,7 @@
                                     type="text"
                                     value={homeInput}
                                     onChange={(e) => setHomeInput(e.target.value)}
-                                    placeholder="Search or type a URL"
+                                    placeholder="Search Bing or type a URL"
                                     className="w-full bg-[#111] border border-[#333] text-white p-4 pl-6 rounded-full shadow-2xl focus:outline-none focus:border-gray-500 focus:ring-1 focus:ring-gray-500 transition-all text-lg placeholder-gray-600"
                                     autoFocus
                                 />
